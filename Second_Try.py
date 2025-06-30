@@ -1,249 +1,206 @@
-import requests
+import asyncio
+import sys
 from bs4 import BeautifulSoup
-import re
-import os
-from fpdf import FPDF # We'll use FPDF for PDF generation as it's straightforward.
+from fpdf import FPDF
+from urllib.parse import urljoin, urlparse
 
-def get_page_content(url):
-    """
-    Fetches the HTML content of a given URL.
-    Args:
-        url (str): The URL of the webpage to fetch.
-    Returns:
-        str: The HTML content of the page, or None if an error occurs.
-    """
+# Try to import Playwright for JS rendering
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+import requests
+
+def prompt_user():
+    url = input('Enter the URL of the webpage to scrape: ').strip()
+    output = input('Enter output PDF filename (default: output.pdf): ').strip()
+    if not output:
+        output = 'output.pdf'
+    return url, output
+
+async def fetch_with_playwright(url):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(url)
+        await page.wait_for_timeout(3000)
+        html = await page.content()
+        await browser.close()
+        return html
+
+def fetch_with_requests(url):
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()  # Raise an exception for HTTP errors
+        response.raise_for_status()
         return response.text
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print(f"Error fetching URL {url}: {e}")
         return None
 
-def extract_page_metadata(soup):
-    """
-    Extracts the page title and meta description from the BeautifulSoup object.
-    Args:
-        soup (BeautifulSoup): The BeautifulSoup object of the parsed HTML.
-    Returns:
-        dict: A dictionary containing the page title and meta description.
-    """
-    title = soup.title.string if soup.title else "No Title Found"
-    meta_description = ""
-    meta_tag = soup.find('meta', attrs={'name': 'description'})
-    if meta_tag and meta_tag.get('content'):
-        meta_description = meta_tag['content'].strip()
-    return {"title": title, "meta_description": meta_description}
+def extract_metadata(soup, url):
+    title = soup.title.string.strip() if soup.title else "No Title"
+    meta_desc = soup.find('meta', attrs={'name': 'description'})
+    meta_desc = meta_desc['content'].strip() if meta_desc else "No Description"
+    return {'title': title, 'url': url, 'meta_desc': meta_desc}
 
-def extract_text_content(soup):
-    """
-    Extracts headings, their associated paragraphs, and standalone paragraphs.
-    Args:
-        soup (BeautifulSoup): The BeautifulSoup object of the parsed HTML.
-    Returns:
-        list: A list of dictionaries, where each dictionary represents a content block.
-              Each block has a 'type' ('heading' or 'paragraph'), 'tag' (e.g., 'h1', 'p'),
-              and 'text' content. Headings also have an associated 'level'.
-    """
-    content_blocks = []
-    # Define tags that typically contain main content
-    content_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'span', 'div']
-    
-    # Iterate through elements to maintain order and context
-    for element in soup.find_all(content_tags):
-        text = element.get_text(separator=" ", strip=True)
-        if not text:
-            continue
-
-        if element.name.startswith('h') and len(element.name) == 2 and element.name[1].isdigit():
-            level = int(element.name[1])
-            content_blocks.append({"type": "heading", "tag": element.name, "level": level, "text": text})
-        elif element.name == 'p':
-            # Avoid adding duplicate paragraphs if they were already captured under a heading
-            if not (content_blocks and content_blocks[-1]["type"] == "paragraph" and content_blocks[-1]["text"] == text):
-                content_blocks.append({"type": "paragraph", "tag": element.name, "text": text})
-        elif element.name == 'li':
-            content_blocks.append({"type": "list_item", "tag": element.name, "text": text})
-        # Add other relevant tags if they contain significant standalone text
-        elif element.name == 'span' and len(text) > 50: # Example: only capture longer spans
-             content_blocks.append({"type": "text", "tag": element.name, "text": text})
-        elif element.name == 'div' and len(text) > 100 and not element.find('h1') and not element.find('p'): # Example: Capture larger div texts without nested main elements
-             content_blocks.append({"type": "text", "tag": element.name, "text": text})
-
-    return content_blocks
+def extract_headings_and_content(soup):
+    content = []
+    for heading in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        heading_text = heading.get_text().strip()
+        section = {'heading': heading_text, 'content': []}
+        next_elem = heading.next_sibling
+        while next_elem:
+            if getattr(next_elem, 'name', None) and next_elem.name.startswith('h'):
+                break
+            if getattr(next_elem, 'name', None) == 'p':
+                section['content'].append(next_elem.get_text().strip())
+            elif getattr(next_elem, 'name', None) == 'ul':
+                for li in next_elem.find_all('li'):
+                    section['content'].append(f"- {li.get_text().strip()}")
+            next_elem = next_elem.next_sibling
+        content.append(section)
+    return content
 
 def extract_links(soup, base_url):
-    """
-    Extracts meaningful links (anchor text and destination URL).
-    Args:
-        soup (BeautifulSoup): The BeautifulSoup object of the parsed HTML.
-        base_url (str): The base URL to resolve relative links.
-    Returns:
-        list: A list of dictionaries, each with 'anchor_text' and 'url'.
-    """
     links = []
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href'].strip()
-        anchor_text = a_tag.get_text(strip=True)
-
-        # Skip empty anchor text or purely icon links
-        if not anchor_text or re.match(r'^\s*$', anchor_text):
-            continue
-
-        # Resolve relative URLs
-        if not href.startswith(('http://', 'https://', 'mailto:', '#')):
-            href = requests.compat.urljoin(base_url, href)
-        
-        # Basic filtering for meaningful links (can be enhanced)
-        if not href.startswith('mailto:') and not href.startswith('#') and len(anchor_text) > 2:
-            links.append({"anchor_text": anchor_text, "url": href})
+    for link in soup.find_all('a', href=True):
+        href = link['href'].strip()
+        if (
+            not href.startswith('javascript:') and
+            not href.startswith('mailto:') and
+            not href.startswith('tel:') and
+            href.strip() != '#'
+        ):
+            link_text = link.get_text().strip() or href
+            full_url = urljoin(base_url, href) if href.startswith('/') else href
+            links.append({'text': link_text, 'url': full_url})
     return links
 
-def extract_downloadable_links(soup, base_url):
-    """
-    Extracts links to downloadable files (e.g., PDFs, documents).
-    Args:
-        soup (BeautifulSoup): The BeautifulSoup object of the parsed HTML.
-        base_url (str): The base URL to resolve relative links.
-    Returns:
-        list: A list of dictionaries, each with 'anchor_text' and 'url'.
-    """
-    download_links = []
-    download_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.zip', '.rar']
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href'].strip()
-        anchor_text = a_tag.get_text(strip=True)
+async def extract_tab_content_playwright(page):
+    tab_data = []
+    try:
+        tabs = await page.query_selector_all('[role="tab"]')
+        for i, tab in enumerate(tabs):
+            tab_name = await tab.inner_text()
+            await tab.click()
+            await page.wait_for_timeout(1000)
+            panel = await page.query_selector('[role="tabpanel"]:not([hidden])')
+            if panel:
+                panel_text = await panel.inner_text()
+                if panel_text.strip():
+                    tab_data.append({'tab_name': tab_name.strip(), 'content': panel_text.strip()})
+    except Exception:
+        pass
+    return tab_data
 
-        if not anchor_text:
-            continue
-
-        # Resolve relative URLs
-        if not href.startswith(('http://', 'https://')):
-            href = requests.compat.urljoin(base_url, href)
-
-        if any(href.lower().endswith(ext) for ext in download_extensions):
-            download_links.append({"anchor_text": anchor_text, "url": href})
-    return download_links
-
-def extract_tab_content(soup, base_url):
-    """
-    Extracts content from tabbed components. This is a highly generalized approach
-    and might need specific adjustments based on the actual HTML structure of tabs.
-    For the thirdeyedata.ai/contact-us/ example, it looks for specific IDs.
-    Args:
-        soup (BeautifulSoup): The BeautifulSoup object of the parsed HTML.
-        base_url (str): The base URL of the page.
-    Returns:
-        dict: A dictionary where keys are tab titles and values are their content.
-    """
-    tab_content = {}
-    # This part is highly dependent on the website's specific tab implementation.
-    # For the thirdeyedata.ai/contact-us/ example, let's look for specific divs.
-    
-    # Example for thirdeyedata.ai/contact-us/
-    # It seems the "Meet with US team" and "Meet with India team" are linked to sections
-    # with IDs like 'us' and 'india'. The content is within those sections.
-    
-    us_team_section = soup.find(id='us')
-    if us_team_section:
-        us_text = us_team_section.get_text(separator="\n", strip=True)
-        tab_content["Meet with US team"] = us_text
-
-    india_team_section = soup.find(id='india')
-    if india_team_section:
-        india_text = india_team_section.get_text(separator="\n", strip=True)
-        tab_content["Meet with India team"] = india_text
-        
-    # General approach for more common tab structures (e.g., using roles, data-attributes)
-    # This is a conceptual example and might need refinement for other sites.
-    # Look for tab buttons and their corresponding content panels
-    # tab_buttons = soup.find_all(role='tab') or soup.find_all(class_=re.compile(r'tab-button'))
-    # for button in tab_buttons:
-    #     tab_name = button.get_text(strip=True)
-    #     # Often, the button's href or data-target points to the content panel's ID
-    #     target_id = button.get('href', '').lstrip('#') or button.get('data-target', '')
-    #     if target_id:
-    #         content_panel = soup.find(id=target_id)
-    #         if content_panel:
-    #             tab_content[tab_name] = content_panel.get_text(separator="\n", strip=True)
-
-    return tab_content
-
-def scrape_website_data(url):
-    """
-    Main function to scrape data from a given URL.
-    Args:
-        url (str): The URL of the webpage to scrape.
-    Returns:
-        dict: A dictionary containing all extracted and structured data.
-    """
-    html_content = get_page_content(url)
-    if not html_content:
-        return None
-
-    soup = BeautifulSoup(html_content, 'html.parser')
-
-    scraped_data = {
-        "url": url,
-        "metadata": extract_page_metadata(soup),
-        "content_blocks": extract_text_content(soup),
-        "links": extract_links(soup, url),
-        "downloadable_links": extract_downloadable_links(soup, url),
-        "tab_content": {}
+def clean_text(text):
+    if not text:
+        return ""
+    replacements = {
+        '\u2192': '->', '\u2190': '<-', '\u2013': '-', '\u2014': '--',
+        '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',
+        '\u2022': '*', '\u2026': '...'
     }
-    
-    # Only try to extract tab content if it's the contact-us page or another known tabbed page
-    if "contact-us" in url:
-        scraped_data["tab_content"] = extract_tab_content(soup, url)
+    for unicode_char, ascii_char in replacements.items():
+        text = text.replace(unicode_char, ascii_char)
+    try:
+        text.encode('latin-1')
+        return text
+    except UnicodeEncodeError:
+        return text.encode('latin-1', errors='ignore').decode('latin-1')
 
-    return scraped_data
+def generate_pdf(metadata, headings, links, tab_data, output_file):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    page_width = pdf.w - 2 * pdf.l_margin
+    # Metadata
+    pdf.set_font("Arial", 'B', 16)
+    pdf.multi_cell(page_width, 10, clean_text(metadata['title']), align='C')
+    pdf.ln(2)
+    pdf.set_font("Arial", '', 12)
+    pdf.multi_cell(page_width, 8, clean_text(metadata['url']), align='C')
+    pdf.ln(2)
+    pdf.multi_cell(page_width, 8, clean_text(metadata['meta_desc']), align='C')
+    pdf.ln(8)
+    # Headings and content
+    for section in headings:
+        pdf.set_font("Arial", 'B', 14)
+        pdf.multi_cell(page_width, 9, clean_text(section['heading']))
+        pdf.ln(1)
+        pdf.set_font("Arial", '', 12)
+        pdf.multi_cell(page_width, 8, clean_text("\n".join(section['content'])))
+        pdf.ln(4)
+    # Links
+    if links:
+        pdf.set_font("Arial", 'B', 14)
+        pdf.multi_cell(page_width, 9, "Links:")
+        pdf.set_font("Arial", '', 12)
+        for link in links:
+            pdf.set_text_color(0, 0, 255)
+            pdf.multi_cell(page_width, 8, clean_text(f"{link['text']} -> {link['url']}"))
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(2)
+    # Tab content
+    if tab_data:
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.multi_cell(page_width, 10, "Tabbed Content")
+        pdf.ln(4)
+        for tab in tab_data:
+            pdf.set_font("Arial", 'B', 14)
+            pdf.multi_cell(page_width, 9, clean_text(tab['tab_name']))
+            pdf.ln(1)
+            pdf.set_font("Arial", '', 12)
+            pdf.multi_cell(page_width, 8, clean_text(tab['content']))
+            pdf.ln(4)
+    pdf.output(output_file)
+    print(f"PDF generated successfully: {output_file}")
+
+async def main():
+    url, output = prompt_user()
+    html = None
+    tab_data = []
+    if PLAYWRIGHT_AVAILABLE:
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(url)
+                await page.wait_for_timeout(3000)
+                html = await page.content()
+                tab_data = await extract_tab_content_playwright(page)
+                await browser.close()
+        except Exception as e:
+            print(f"Playwright failed: {e}\nFalling back to requests.")
+    if not html:
+        html = fetch_with_requests(url)
+    if not html:
+        print("Failed to fetch the page. Exiting.")
+        sys.exit(1)
+    soup = BeautifulSoup(html, 'html.parser')
+    metadata = extract_metadata(soup, url)
+    headings = extract_headings_and_content(soup)
+    links = extract_links(soup, url)
+    generate_pdf(metadata, headings, links, tab_data, output)
 
 if __name__ == "__main__":
-    # Example usage for scraping:
-    # This part will be used to demonstrate the data extraction
-    # before we integrate with PDF generation.
-    
-    print("Scraping ThirdEye Data homepage...")
-    homepage_url = "https://thirdeyedata.ai"
-    homepage_data = scrape_website_data(homepage_url)
-
-    if homepage_data:
-        print("\n--- Scraped Homepage Data ---")
-        print(f"URL: {homepage_data['url']}")
-        print(f"Title: {homepage_data['metadata']['title']}")
-        print(f"Meta Description: {homepage_data['metadata']['meta_description']}")
-        
-        print("\n--- Content Blocks ---")
-        for block in homepage_data['content_blocks']:
-            if block['type'] == 'heading':
-                print(f"  {'#' * block['level']} {block['text']}")
-            else:
-                print(f"  {block['text']}")
-        
-        print("\n--- Links ---")
-        for link in homepage_data['links']:
-            print(f"  Anchor: {link['anchor_text']} -> URL: {link['url']}")
-
-        print("\n--- Downloadable Links ---")
-        if homepage_data['downloadable_links']:
-            for link in homepage_data['downloadable_links']:
-                print(f"  Download: {link['anchor_text']} -> URL: {link['url']}")
-        else:
-            print("  No downloadable links found.")
-
-    print("\nScraping ThirdEye Data Contact Us page for tab content...")
-    contact_us_url = "https://thirdeyedata.ai/contact-us/"
-    contact_us_data = scrape_website_data(contact_us_url)
-
-    if contact_us_data and contact_us_data["tab_content"]:
-        print("\n--- Tab Content from Contact Us Page ---")
-        for tab_name, content in contact_us_data["tab_content"].items():
-            print(f"\nTab: {tab_name}")
-            print(content)
-    elif contact_us_data:
-        print("\nNo specific tab content found on the Contact Us page using current logic.")
+    if PLAYWRIGHT_AVAILABLE:
+        asyncio.run(main())
     else:
-        print("\nCould not scrape Contact Us page.")
+        # fallback to sync main if Playwright is not installed
+        url, output = prompt_user()
+        html = fetch_with_requests(url)
+        if not html:
+            print("Failed to fetch the page. Exiting.")
+            sys.exit(1)
+        soup = BeautifulSoup(html, 'html.parser')
+        metadata = extract_metadata(soup, url)
+        headings = extract_headings_and_content(soup)
+        links = extract_links(soup, url)
+        generate_pdf(metadata, headings, links, [], output)

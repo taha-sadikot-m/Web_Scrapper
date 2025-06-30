@@ -1,59 +1,42 @@
-#python web_scraper.py https://thirdeyedata.ai -o thirdeye.pdf
-
-
-import argparse
-import time
-import requests
+import asyncio
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from fpdf import FPDF
 from urllib.parse import urljoin, urlparse
 
-class WebScraperPDFGenerator:
+class PlaywrightPDFScraper:
     def __init__(self, url):
         self.url = url
         self.domain = urlparse(url).netloc
         self.content_data = []
         self.tab_data = []
-        self.driver = None
-        self.soup = None
         self.pdf = FPDF()
         self.pdf.set_auto_page_break(auto=True, margin=15)
         self.pdf.add_page()
         self.pdf.set_font("Arial", size=12)
-        self.setup_selenium()
 
-    def setup_selenium(self):
-        """Initialize headless Chrome browser"""
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920x1080")
-        self.driver = webdriver.Chrome(options=chrome_options)
-        self.driver.get(self.url)
-        time.sleep(3)  # Allow JavaScript rendering
+    async def fetch_page(self):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(self.url)
+            await page.wait_for_timeout(3000)  # Wait for JS rendering
+            html = await page.content()
+            self.soup = BeautifulSoup(html, 'html.parser')
+            await self.extract_tab_content(page)
+            await browser.close()
 
     def extract_content(self):
-        """Extract all required content from the page"""
-        self.soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-        
         # Extract metadata
         title = self.soup.title.string.strip() if self.soup.title else "No Title"
         meta_desc = self.soup.find('meta', attrs={'name': 'description'})
         meta_desc = meta_desc['content'].strip() if meta_desc else "No Description"
-        
-        # Add metadata to content
         self.content_data.append({
             'type': 'metadata',
             'title': title,
             'url': self.url,
             'meta_desc': meta_desc
         })
-        
         # Extract headings and content
         for heading in self.soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
             heading_text = heading.get_text().strip()
@@ -63,7 +46,6 @@ class WebScraperPDFGenerator:
                 'heading': heading_text,
                 'content': content
             })
-        
         # Extract links
         for link in self.soup.find_all('a', href=True):
             if self.is_valid_link(link['href']):
@@ -73,60 +55,41 @@ class WebScraperPDFGenerator:
                     'text': link_text,
                     'url': self.normalize_url(link['href'])
                 })
-        
-        # Extract tab content
-        self.extract_tab_content()
 
     def extract_associated_content(self, heading):
-        """Extract content associated with a heading"""
         content = []
         next_elem = heading.next_sibling
-        
         while next_elem:
-            if next_elem.name and next_elem.name.startswith('h'):
+            if getattr(next_elem, 'name', None) and next_elem.name.startswith('h'):
                 break
-            
-            if next_elem.name == 'p':
+            if getattr(next_elem, 'name', None) == 'p':
                 content.append(next_elem.get_text().strip())
-            elif next_elem.name == 'ul':
+            elif getattr(next_elem, 'name', None) == 'ul':
                 for li in next_elem.find_all('li'):
                     content.append(f"- {li.get_text().strip()}")
-            
             next_elem = next_elem.next_sibling
-        
         return "\n".join(content)
 
-    def extract_tab_content(self):
-        """Extract content from tab components"""
+    async def extract_tab_content(self, page):
+        # Try to click through tabs if present
         try:
-            tabs = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, '[role="tab"]'))
-            )
-            
-            for i in range(len(tabs)):
-                tabs = self.driver.find_elements(By.CSS_SELECTOR, '[role="tab"]')
-                if i >= len(tabs):
-                    continue
-                
-                tab = tabs[i]
-                tab_name = tab.text.strip()
-                tab.click()
-                time.sleep(1)  # Wait for content to load
-                
-                # Find active tab panel
-                active_panel = self.driver.find_element(By.CSS_SELECTOR, '[role="tabpanel"]:not([hidden])')
-                panel_text = active_panel.text.strip()
-                
-                if panel_text:
-                    self.tab_data.append({
-                        'tab_name': tab_name,
-                        'content': panel_text
-                    })
+            tabs = await page.query_selector_all('[role="tab"]')
+            for i, tab in enumerate(tabs):
+                tab_name = await tab.inner_text()
+                await tab.click()
+                await page.wait_for_timeout(1000)
+                panel = await page.query_selector('[role="tabpanel"]:not([hidden])')
+                if panel:
+                    panel_text = await panel.inner_text()
+                    if panel_text.strip():
+                        self.tab_data.append({
+                            'tab_name': tab_name.strip(),
+                            'content': panel_text.strip()
+                        })
         except Exception:
-            pass  # No tab components found
+            pass
 
     def is_valid_link(self, href):
-        """Check if link should be included"""
         return (
             not href.startswith('javascript:') and
             not href.startswith('mailto:') and
@@ -135,43 +98,26 @@ class WebScraperPDFGenerator:
         )
 
     def normalize_url(self, url):
-        """Convert relative URLs to absolute"""
         return urljoin(self.url, url) if url.startswith('/') else url
 
     def clean_text(self, text):
-        """Clean text to remove characters that can't be encoded in Latin-1"""
         if not text:
             return ""
-        
-        # Replace common Unicode characters with ASCII equivalents
         replacements = {
-            '\u2192': '->',  # right arrow
-            '\u2190': '<-',  # left arrow
-            '\u2013': '-',   # en dash
-            '\u2014': '--',  # em dash
-            '\u2018': "'",   # left single quotation mark
-            '\u2019': "'",   # right single quotation mark
-            '\u201c': '"',   # left double quotation mark
-            '\u201d': '"',   # right double quotation mark
-            '\u2022': '*',   # bullet
-            '\u2026': '...',  # horizontal ellipsis
+            '\u2192': '->', '\u2190': '<-', '\u2013': '-', '\u2014': '--',
+            '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',
+            '\u2022': '*', '\u2026': '...'
         }
-        
         for unicode_char, ascii_char in replacements.items():
             text = text.replace(unicode_char, ascii_char)
-        
-        # Remove any remaining non-Latin-1 characters
         try:
             text.encode('latin-1')
             return text
         except UnicodeEncodeError:
-            # If there are still problematic characters, encode and decode to remove them
             return text.encode('latin-1', errors='ignore').decode('latin-1')
 
     def generate_pdf(self, output_file):
-        """Generate PDF report"""
         page_width = self.pdf.w - 2 * self.pdf.l_margin
-        # Add metadata
         metadata = next(item for item in self.content_data if item['type'] == 'metadata')
         self.pdf.set_font("Arial", 'B', 16)
         self.pdf.multi_cell(page_width, 10, self.clean_text(metadata['title']), align='C')
@@ -181,8 +127,6 @@ class WebScraperPDFGenerator:
         self.pdf.ln(2)
         self.pdf.multi_cell(page_width, 8, self.clean_text(metadata['meta_desc']), align='C')
         self.pdf.ln(8)
-        
-        # Add main content
         for item in self.content_data:
             if item['type'] == 'heading_content':
                 self.pdf.set_font("Arial", 'B', 14)
@@ -197,14 +141,11 @@ class WebScraperPDFGenerator:
                 self.pdf.multi_cell(page_width, 8, self.clean_text(f"{item['text']} -> {item['url']}"))
                 self.pdf.set_text_color(0, 0, 0)
                 self.pdf.ln(2)
-        
-        # Add tab content if exists
         if self.tab_data:
             self.pdf.add_page()
             self.pdf.set_font("Arial", 'B', 16)
             self.pdf.multi_cell(page_width, 10, "Tabbed Content")
             self.pdf.ln(4)
-            
             for tab in self.tab_data:
                 self.pdf.set_font("Arial", 'B', 14)
                 self.pdf.multi_cell(page_width, 9, self.clean_text(tab['tab_name']))
@@ -212,21 +153,18 @@ class WebScraperPDFGenerator:
                 self.pdf.set_font("Arial", '', 12)
                 self.pdf.multi_cell(page_width, 8, self.clean_text(tab['content']))
                 self.pdf.ln(4)
-        
-        # Save PDF
         self.pdf.output(output_file)
-        self.driver.quit()
         print(f"PDF generated successfully: {output_file}")
 
-def main():
+async def main():
     url = input('Enter the URL of the webpage to scrape: ').strip()
     output = input('Enter output PDF filename (default: output.pdf): ').strip()
     if not output:
         output = 'output.pdf'
-
-    scraper = WebScraperPDFGenerator(url)
+    scraper = PlaywrightPDFScraper(url)
+    await scraper.fetch_page()
     scraper.extract_content()
     scraper.generate_pdf(output)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main()) 
